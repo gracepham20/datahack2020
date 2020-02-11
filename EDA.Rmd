@@ -1,0 +1,215 @@
+---
+title: "EDA"
+author: "Chun Su"
+date: "2/10/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# 1. data cleaning
+
+I further clean the data based on what Mitch has done so far, specifically focusin on
+
+ *  remove space within columns os that it is easy to access by auto-fill.  
+ *  convert latitude and logtitude info to estimated address and zipcode using `ggmap`.  
+ *  (for R user only) convert IncidentDate to date class.  
+
+```{r cleanup, eval = FALSE}
+library(tidyverse)
+library(lubridate)
+# Mitch initial cleanup
+OD_info <- read_csv("data/Overdose_Information_Network_Data_CY_January_2018_-_Current_Monthly_County_State_Police.csv")
+
+OD_unique <- OD_info %>%
+  dplyr::select(
+    `Incident ID`:`Victim County`, `Incident County FIPS Code`:`Victim County Latitude and Longitude`, `Naloxone Administered`, `Response Time Desc`,
+    Survive
+  ) %>%
+  distinct()
+
+OD_drug <- OD_info %>%
+  dplyr::select(`Accidental Exposure`:`Susp OD Drug Desc`, `Incident ID`, `Victim ID`) %>%
+  distinct() %>%
+  mutate(tmp = 1) %>%
+  pivot_wider(id_cols = c(`Incident ID`, `Victim ID`), values_from = tmp, values_fill = list(tmp = 0), names_from = `Susp OD Drug Desc`)
+
+OD_all <- inner_join(OD_unique,OD_drug)
+
+# rename columan to remove space
+colnames(OD_all) <- gsub(" ", "",colnames(OD_all))
+
+# remove redundant columns
+OD_all <- OD_all %>% select(-IncidentCountyLatitudeandLongitude, -VictimCountyLatitudeandLongitude)
+
+# convert longitude and latitude info to address
+# register_google(key = <API_key>) # get API_key from https://console.cloud.google.com/apis/credentials 
+lon_lat_to_address <- function(lat, lon){
+        res <- revgeocode(c(lon,lat), output="address")
+        res
+}
+
+OD_all <- OD_all %>% 
+        mutate(IncidentEstimatedAddress=mapply(lon_lat_to_address,IncidentCountyLatitude, IncidentCountyLongitude)) %>% 
+        mutate(VictimEstimatedAddress=mapply(lon_lat_to_address,VictimCountyLatitude, VictimCountyLongitude))
+address="1307 E Baltimore Pike, Media, PA 19063, USA"
+
+# convert address to zipcode
+address2zipcode <- function(address){
+        if (is.na(address)){
+                zipcode=NA
+        }else{
+                tmp = strsplit(address, ",")[[1]]
+                zipcode=tmp[length(tmp)-1]
+                zipcode=gsub("PA","",zipcode)
+                zipcode=gsub(" ","",zipcode)
+        }
+        zipcode
+        
+}
+
+OD_all = OD_all %>% 
+        mutate(IncidentZipcode=sapply(IncidentEstimatedAddress,address2zipcode))
+
+OD_all = OD_all %>% 
+        mutate(VictimZipcode=sapply(VictimEstimatedAddress,address2zipcode))
+
+OD_all %>% select(contains("Zipcode"))
+
+# convert date
+OD_all <- OD_all %>% 
+        mutate(IncidentDate=parse_date(IncidentDate, "%m/%d/%y"))
+
+# save R object and csv
+save(OD_all, file="data/OD_all_processedCS.Rdata")
+write_csv(
+        OD_all,
+        path="data/OD_all_processedCS.csv"
+)
+```
+
+# 2. EDA on county
+
+Generally, this date include the 10774 incident reports from 2018-01-01 to 2020-01-15 involving 10953 victims from 67 counties from Pennsylvania. Those victims include 7516 males and 3412 females (25 unknown), with majority age range from 20 to 49 (which contributes to 86% victims) and age range 30 - 39 have highest number of victim. 7236 (66.06%) of those victims have been administered with Naloxone and 8471 (77.3%) survived.
+
+```{r general, echo=F, message=F, warning=F, results="hide"}
+library(tidyverse)
+library(lubridate)
+load("data/OD_all_processedCS.Rdata")
+OD_all %>% summarise(min(IncidentDate))
+OD_all %>% summarise(max(IncidentDate))
+OD_all %>% summarise(n_distinct(IncidentID))
+OD_all %>% summarise(n_distinct(VictimID))
+OD_all %>% summarise(n_distinct(IncidentCountyName))
+
+# group by gender
+OD_all %>% 
+        group_by(GenderDesc) %>% 
+        summarise(n_distinct(VictimID))
+
+# group by AgeRange
+OD_all %>% 
+        group_by(AgeRange) %>% 
+        summarise(n_distinct(VictimID))
+
+# group by Survive
+OD_all %>% 
+        group_by(Survive) %>% 
+        summarise(n_distinct(VictimID))
+
+# group by NaloxoneAdministered
+OD_all %>% 
+        group_by(NaloxoneAdministered) %>% 
+        summarise(n_distinct(VictimID))
+```
+
+To carefully investigate the age range rate, gender rate, NaloxoneAdministered rate, Survive rate within Philadephia and outside of Philadephia, I grouped the victims to IncidentCounty.
+
+```{r nalo_survive_incidentcounty, message=F}
+df = OD_all %>% 
+        mutate(IncidentCountPhilly=ifelse(IncidentCountyName=="Philadelphia", "Y","N")) %>% 
+        group_by(IncidentCountPhilly, GenderDesc, NaloxoneAdministered, Survive, AgeRange) %>% 
+        summarise(victim_n = n_distinct(VictimID)) %>% 
+        ungroup()
+
+
+# gender ratio
+df1 = left_join(
+        df %>% group_by(IncidentCountPhilly, GenderDesc) %>% 
+                summarise(victim_n=sum(victim_n)) %>% 
+                ungroup(),
+        df %>% group_by(IncidentCountPhilly) %>% 
+                summarise(total=sum(victim_n)) %>% 
+                ungroup()
+)
+       
+
+df1 = df1 %>% filter(GenderDesc=="Male") %>% 
+        mutate(isMale=victim_n/total) %>% 
+        select(IncidentCountPhilly, isMale)
+
+# NaloxoneAdministered rate
+df2 = left_join(
+        df %>% group_by(IncidentCountPhilly, NaloxoneAdministered) %>% 
+                summarise(victim_n=sum(victim_n)) %>% 
+                ungroup(),
+        df %>% group_by(IncidentCountPhilly) %>% 
+                summarise(total=sum(victim_n)) %>% 
+                ungroup()
+)
+
+df2 = df2 %>% filter(NaloxoneAdministered=="Y") %>% 
+        mutate(NaloxoneAdministered=victim_n/total) %>% 
+        select(IncidentCountPhilly, NaloxoneAdministered)
+
+# Survive rate
+df3 = left_join(
+        df %>% group_by(IncidentCountPhilly, Survive) %>% 
+                summarise(victim_n=sum(victim_n)) %>% 
+                ungroup(),
+        df %>% group_by(IncidentCountPhilly) %>% 
+                summarise(total=sum(victim_n)) %>% 
+                ungroup()
+)
+
+df3 = df3 %>% filter(Survive=="Y") %>% 
+        mutate(Survived=victim_n/total) %>% 
+        select(IncidentCountPhilly, Survived)
+
+df_ratio = bind_rows(
+        df1 %>% mutate(type="isMale") %>% dplyr::rename(ratio=isMale),
+        df2 %>% mutate(type="NaloxoneAdministered") %>% dplyr::rename(ratio=NaloxoneAdministered),
+        df3 %>% mutate(type="Survived") %>% dplyr::rename(ratio=Survived)
+)
+
+ggplot(df_ratio, aes(x=type, y=ratio, fill=IncidentCountPhilly)) +
+        geom_col(position="dodge") +
+        theme_bw() +
+        xlab("") +
+        ylab("percentage of total victim")
+
+# age range rate
+df4 = left_join(
+        df %>% group_by(IncidentCountPhilly, AgeRange) %>% 
+                summarise(victim_n=sum(victim_n)) %>% 
+                ungroup(),
+        df %>% group_by(IncidentCountPhilly) %>% 
+                summarise(total=sum(victim_n)) %>% 
+                ungroup()
+)
+
+df4 = df4 %>% mutate(ratio=victim_n/total)
+df4 = df4 %>% mutate(AgeRange=ifelse(AgeRange=="14-Oct","10-14",AgeRange))
+ggplot(df4, aes(x=AgeRange, y=ratio, fill=IncidentCountPhilly)) +
+        facet_wrap(~IncidentCountPhilly) +
+        geom_col(position = "dodge") + 
+        theme_bw() +
+        theme(legend.position = "bottom", 
+              axis.text.x = element_text(angle=60, vjust = 0.5))
+```
+
+
+Philadelphia, where Prevention Point is located, have higher ratio of victim who have been administered with Narcan before and higher survival rate of overdose. However, high survival rate may not be directly associated with Narcan administrated rate. There are victim population structure (age, gender) difference between Philly and other PA counties too.
+
